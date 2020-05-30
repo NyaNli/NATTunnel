@@ -500,7 +500,7 @@ class NATTunnelTCPClient(AbstractTunnel):
         except Exception as ex:
             self._err(client, ex)
             raise SocketError(client, ex)
-        print('[Client] New TCP Connection %s as %s' % (client.getsockname(), key))
+        print('[TCPClient:%d] New TCP Connection %s as %s' % (self.__remote_port, client.getsockname(), key))
 
     def _onUserMsg(self, conn : socket, packet : Packet):
         self.__lastaccess = time()
@@ -524,7 +524,7 @@ class NATTunnelTCPClient(AbstractTunnel):
         key = str((packet.host, packet.port))
         if key in self.__clients:
             client = self.__clients[key]
-            print('[Client] TCP Connection %s as %s disconnected by remote.' % (client.getsockname(), key))
+            print('[TCPClient:%d] TCP Connection %s as %s disconnected by remote.' % (self.__remote_port, client.getsockname(), key))
             client.close()
             del self.__clients[key]
             self._removeSocket(client)
@@ -532,7 +532,7 @@ class NATTunnelTCPClient(AbstractTunnel):
             print('Unknown connection %s' % key)
 
     def _onErrorMsg(self, conn : socket, packet : Packet):
-        print('[Error] %s' % packet.data.decode('utf-8'))
+        print('[TCPClient:%d] Server Error: %s' % (self.__remote_port, packet.data.decode('utf-8')))
 
     def _onPong(self, conn : socket, packet : Packet):
         pass
@@ -554,7 +554,7 @@ class NATTunnelTCPClient(AbstractTunnel):
             packet.data = data
         else:
             packet.op = Packet.OP_USER_DISCONN
-            print('[Client] TCP Connection %s as %s disconnected by local.' % (conn.getsockname(), key))
+            print('[TCPClient:%d] TCP Connection %s as %s disconnected by local.' % (self.__remote_port, conn.getsockname(), key))
             self._removeSocket(conn)
             del self.__clients[key]
             conn.close()
@@ -574,7 +574,7 @@ class NATTunnelTCPClient(AbstractTunnel):
             packet.send(self.__remote)
             self.__lastaccess = time()
             del self.__clients[key]
-            print('[Client] TCP Connection %s as %s disconnected by local.' % (conn.getsockname(), key))
+            print('[TCPClient:%d] TCP Connection %s as %s disconnected by local.' % (self.__remote_port, conn.getsockname(), key))
 
 class NATTunnelUDPClient(AbstractTunnel):
     def __init__(self, server_addr : str, local_addr : tuple, remote_port : int, server_port : int = 12345):
@@ -612,7 +612,7 @@ class NATTunnelUDPClient(AbstractTunnel):
             if time() - l > UDP_IDLE_TIMEOUT:
                 delk.append(k)
         for k in delk:
-            print('[Client] UDP Connection %s as %s idle timeout expired.' % (self.__clients[k].getsockname(), k))
+            print('[UDPClient:%d] UDP Connection %s as %s idle timeout expired.' % (self.__remote_port, self.__clients[k].getsockname(), k))
             self._removeSocket(self.__clients[k])
             self.__clients[k].close()
             del self.__clients[k]
@@ -635,10 +635,10 @@ class NATTunnelUDPClient(AbstractTunnel):
         client = self.__clients[key]
         client.sendto(packet.data, self.__local_addr)
         if first:
-            print('[Client] New UDP Connection %s as %s' % (client.getsockname(), key))
+            print('[UDPClient:%d] New UDP Connection %s as %s' % (self.__remote_port, client.getsockname(), key))
 
     def _onErrorMsg(self, conn : socket, packet : Packet):
-        print('[Error] %s' % packet.data.decode('utf-8'))
+        print('[UDPClient:%d] Server Error: %s' % (self.__remote_port, packet.data.decode('utf-8')))
 
     def _onPong(self, conn : socket, packet : Packet):
         pass
