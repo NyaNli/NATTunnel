@@ -8,6 +8,12 @@ Support TCP and UDP, support SSL transmission process encryption (I do not provi
 原理是将服务器端建立的端口的所有连接、断开、数据事件打包返回本地，在本地进行模拟，再将本地的模拟结果打包发给服务端，由服务端执行响应  
 The principle is to package all of the socket events from server and return them to the local place for simulation, and then package the local simulation results to the server for response.  
 
+\[2020-05-30] 重构代码，新增命令行支持，不写代码也可以直接使用功能  
+
 效果图？  
+早期开发版：  
 ![v0.1.12](https://user-images.githubusercontent.com/20377926/83137226-63df7800-a11b-11ea-86a7-e4595f7bc9a8.png)  
-![v9999.9999.9999](https://user-images.githubusercontent.com/20377926/83137218-60e48780-a11b-11ea-9472-ea1c0f613fe4.png)
+代码重构前：  
+![v9999.9999.9999](https://user-images.githubusercontent.com/20377926/83137218-60e48780-a11b-11ea-9472-ea1c0f613fe4.png)  
+目前版本：  
+![SuperUltraFinalVersion](https://user-images.githubusercontent.com/20377926/83316644-92fc0380-a259-11ea-8c02-1f55bcf2bef8.png)

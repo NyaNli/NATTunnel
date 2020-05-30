@@ -1,464 +1,805 @@
+from threading import Thread
+from socket import socket, AF_INET, SOCK_STREAM, SOCK_DGRAM
+from ssl import wrap_socket, PROTOCOL_TLSv1_2
+from struct import pack, unpack
+from select import select
+from time import sleep, time
+
+class SocketError(RuntimeError):
+    def __init__(self, conn, ex):
+        self.conn = conn
+        self.ex = ex
+
+# Full Packet:
+# | 'NATT' | Sub Packet Size (4 Bytes) | Sub Packet |
+# Sub Packet:
+# | Operate (1 Byte) | Port (2 Bytes) | Hostname String Length (2 Bytes) | Hostname String | Data |
 class Packet:
 
-    OP_BIND_TCP = 0
-    OP_BIND_UDP = 1
-    OP_CLIENT_CONN = 2
-    OP_CLIENT_SEND = 3
-    OP_CLIENT_DISCONN = 4
-    OP_PING = 5
-    OP_PONG = 6
+    MAGIC_NUM = b'NATT'
+    MAGIC_TLS = b'\x16\x03'
 
-    def __init__(self, head : bytes = None):
-        self.op : int = 0
-        self.client_ip : str = '0.0.0.0'
-        self.client_port : int = 0
-        self.data_len : int = 0
-        self.data : bytes = b''
-        if head:
-            import struct
-            self.op, ip1, ip2, ip3, ip4, self.client_port, self.data_len = struct.unpack('!BBBBBHI', head)
-            self.client_ip = '%d.%d.%d.%d' % (ip1, ip2, ip3, ip4)
+    OP_SOCKET_CLOSED = 0
+    OP_BIND_TCP = 1
+    OP_BIND_UDP = 2
+    OP_USER_CONN = 3
+    OP_USER_MSG = 4
+    OP_USER_DISCONN = 5
+    OP_ERROR = 6
+    OP_PING = 7
+    OP_PONG = 8
 
-    def toBytes(self) -> bytes:
-        import struct
-        ip_part = self.client_ip.split('.')
-        return struct.pack('!BBBBBHI', self.op, int(ip_part[0]), int(ip_part[1]), int(ip_part[2]), int(ip_part[3]), self.client_port, len(self.data)) + self.data
+    def __init__(self, conn : socket = None):
+        def recvAll(size) -> bytes:
+            if size == 0:
+                return b''
+            data = b''
+            if size > 0:
+                while len(data) < size:
+                    d = conn.recv(size - len(data))
+                    if not d:
+                        return None
+                    data += d
+            return data
 
-    def __repr__(self):
-        return '[op=%d, ip=%s, port=%d, data_len=%d]' % (self.op, self.client_ip, self.client_port, len(self.data))
+        self.op = Packet.OP_SOCKET_CLOSED
+        self.host = '0.0.0.0'
+        self.port = 0
+        self.data = b''
 
-import socket
-import ssl
-import threading
+        if conn:
+            magic = recvAll(4)
+            if not magic:
+                return
+            if magic != Packet.MAGIC_NUM:
+                if magic[:2] == Packet.MAGIC_TLS:
+                    return
+                raise RuntimeError('Wrong Packet.')
+            datasize = recvAll(4)
+            if not datasize:
+                return
+            data = recvAll(*unpack('!I', datasize))
+            if not data:
+                return
+            self._resolvePacket(data)
 
-PROTOCOL_TCP = 0
-PROTOCOL_UDP = 1
-
-PACKET_SIZE = len(Packet().toBytes())
-
-TCP_DATA_SIZE = 8192
-UDP_DATA_SIZE = 65507
-
-BLOCK_TIMEOUT = 1
-PINGPONG_TIME = 30
-UDP_TIMEOUT = 120
-
-def recvPacket(conn : socket.socket) -> Packet:
-    try:
-        head = conn.recv(PACKET_SIZE)
-    except:
-        return None
-    if not head:
-        return None
-    while len(head) < PACKET_SIZE:
-        head += conn.recv(PACKET_SIZE - len(head))
-    packet = Packet(head)
-    if packet.data_len > 0:
-        data = conn.recv(packet.data_len)
-        if not data:
-            return None
-        while len(data) < packet.data_len:
-            data += conn.recv(packet.data_len - len(data))
-        packet.data = data
-    return packet
-
-class NATTunnelServer(threading.Thread):
-
-    class __VirtualServer(threading.Thread):
-
-        def __init__(self, conn : socket.socket):
-            super().__init__(name='Virtual Server')
-            self.source = conn
-            self.socks = [conn]
-            self.target = None
-            self.protoType = -1
-            self.shouldStop = False
-
-        def stop(self):
-            self.shouldStop = True
-
-        def run(self):
-            try:
-                self.__run()
-            finally:
-                for s in self.socks:
-                    s.close()
-
-        def __run(self):
-            import select
-            import time
-            begin = time.time()
-
-            def findConn(addr : str, port : int) -> socket.socket:
-                for sock in self.socks:
-                    if sock is self.source or sock is self.target:
-                        continue
-                    peer = sock.getpeername()
-                    if peer[0] == addr and peer[1] == port:
-                        return sock
-                return None
-
-            while not getattr(self.source, '_closed') and not self.shouldStop:
-                readable, writable, exceptional = select.select(self.socks, [], self.socks, BLOCK_TIMEOUT)
-                sock : socket.socket
-                for sock in readable:
-                    if sock is self.source:
-                        packet = recvPacket(self.source)
-                        # print('RECV')
-                        # print(packet)
-                        if not packet:
-                            print('[Server] NATTunnelClient %s Disconnected' % str(self.source.getpeername()))
-                            self.source.close()
-                            break
-
-                        if packet.op == Packet.OP_BIND_TCP:
-                            self.protoType = PROTOCOL_TCP
-                            self.target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            self.target.bind(('0.0.0.0', packet.client_port))
-                            self.setName('Virtual Server TCP:%d' % packet.client_port)
-                            self.target.listen()
-                            self.socks.append(self.target)
-                            print('[Server] NATTunnelClient %s Bind TCP Port %d' % (str(self.source.getpeername()), packet.client_port))
-
-                        elif packet.op == Packet.OP_BIND_UDP:
-                            self.protoType = PROTOCOL_UDP
-                            self.target = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                            self.target.bind(('0.0.0.0', packet.client_port))
-                            self.setName('Virtual Server UDP:%d' % packet.client_port)
-                            self.socks.append(self.target)
-                            print('[Server] NATTunnelClient %s Bind UDP Port %d' % (str(self.source.getpeername()), packet.client_port))
-
-                        elif packet.op == Packet.OP_CLIENT_SEND:
-                            if self.protoType == PROTOCOL_TCP:
-                                client = findConn(packet.client_ip, packet.client_port)
-                                if client:
-                                    client.sendall(packet.data)
-                            elif self.protoType == PROTOCOL_UDP:
-                                self.target.sendto(packet.data, (packet.client_ip, packet.client_port))
-                            else:
-                                raise Exception('No Listener.')
-
-                        elif packet.op == Packet.OP_CLIENT_DISCONN:
-                            client = findConn(packet.client_ip, packet.client_port)
-                            if client:
-                                self.socks.remove(client)
-                                print('[Server] TCP Connection %s Disconnected By Client' % str(client.getpeername()))
-                                client.close()
-
-                        elif packet.op == Packet.OP_PING:
-                            packet = Packet()
-                            packet.op = Packet.OP_PONG
-                            self.source.sendall(packet.toBytes())
-                        
-                        else:
-                            raise Exception('Packet Error')
-                    elif sock is self.target:
-                        if self.protoType == PROTOCOL_TCP:
-                            conn, addr = self.target.accept()
-                            self.socks.append(conn)
-                            print('[Server] New Connection %s Connect to Port %d' % (str(conn.getpeername()), self.target.getsockname()[1]))
-                            packet = Packet()
-                            packet.op = Packet.OP_CLIENT_CONN
-                            packet.client_ip, packet.client_port = conn.getpeername()
-                            
-                            # print('SEND')
-                            # print(packet)
-                            
-                            self.source.sendall(packet.toBytes())
-                        else:
-                            data, addr = self.target.recvfrom(UDP_DATA_SIZE)
-                            packet = Packet()
-                            packet.op = Packet.OP_CLIENT_SEND
-                            packet.client_ip, packet.client_port = addr
-                            packet.data = data
-
-                            # print('SEND')
-                            # print(packet)
-
-                            self.source.sendall(packet.toBytes())
-                    else:
-                        try:
-                            data = sock.recv(TCP_DATA_SIZE)
-                        except:
-                            if not sock in exceptional:
-                                exceptional.append(sock)
-                            continue
-                        if data:
-                            packet = Packet()
-                            packet.op = Packet.OP_CLIENT_SEND
-                            packet.client_ip, packet.client_port = sock.getpeername()
-                            packet.data = data
-
-                            # print('SEND')
-                            # print(packet)
-
-                            self.source.sendall(packet.toBytes())
-                        else:
-                            self.socks.remove(sock)
-                            print('[Server] TCP Connection %s Disconnected By User' % str(sock.getpeername()))
-                            packet = Packet()
-                            packet.op = Packet.OP_CLIENT_DISCONN
-                            packet.client_ip, packet.client_port = sock.getpeername()
-                            sock.close()
-
-                            # print('SEND')
-                            # print(packet)
-
-                            self.source.sendall(packet.toBytes())
-                for sock in exceptional:
-                    print('Exception on: %s' % str(sock))
-                    if sock is self.source or sock is self.target:
-                        print('[Server] NATTunnelClient %s Disconnected' % str(sock.getpeername()))
-                        self.source.close()
-                    else:
-                        self.socks.remove(sock)
-                        print('[Server] TCP Connection %s Disconnected By Error' % str(sock.getpeername()))
-                        packet = Packet()
-                        packet.op = Packet.OP_CLIENT_DISCONN
-                        packet.client_ip, packet.client_port = sock.getpeername()
-                        sock.close()
-
-                        # print('SEND')
-                        # print(packet)
-
-                        self.source.sendall(packet.toBytes())
-
-                if not getattr(self.source, '_closed') and not self.target and time.time() - begin > BLOCK_TIMEOUT: # First Packet Timeout
-                    self.source.close()
-
-            for s in self.socks:
-                s.close()
-
-    def __init__(self, port : int = 2345, cert : str = None, key : str = None):
-        super().__init__(name='NATTunnel Server Thread')
-        self.shouldStop = False
-        self.vslist = []
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.bind(('0.0.0.0', port))
-        self.sock.listen()
-        if cert:
-            self.sock = ssl.wrap_socket(self.sock, keyfile = key, certfile = cert, server_side = True, ssl_version=ssl.PROTOCOL_TLSv1_2)
-    
-    def stop(self):
-        self.shouldStop = True
-
-    def run(self):
-        self.sock.settimeout(BLOCK_TIMEOUT)
-        while not self.shouldStop:
-            try:
-                conn, addr = self.sock.accept()
-            except socket.timeout:
-                continue
-            except ssl.SSLError:
-                print('It seems that someone forgot to turn on SSL.')
-                continue
-            vs = NATTunnelServer.__VirtualServer(conn)
-            self.vslist.append(vs)
-            vs.start()
-        for vs in self.vslist:
-            vs.stop()
-        self.sock.close()
-
-class NATTunnelClient(threading.Thread):
-
-    def __init__(self, server_addr : str, localaddr : tuple, remoteport : int, server_port : int = 2345, protocol : int = PROTOCOL_TCP, use_ssl : bool = False, ca : str = None):
-        super().__init__(name='NATTunnel Client Thread')
-        self.localaddr = localaddr
-        self.remoteport = remoteport
-        self.protocol = protocol
-        if self.protocol != PROTOCOL_TCP and self.protocol != PROTOCOL_UDP:
-            raise Exception('No such protocol: %d' % protocol)
-        self.shouldStop = False
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((server_addr, server_port))
-        if use_ssl:
-            self.sock = ssl.wrap_socket(self.sock, ssl_version=ssl.PROTOCOL_TLSv1_2, ca_certs=ca)
-        
-        self.socks = [self.sock]
-        
-        packet = Packet()
-        packet.client_port = self.remoteport
-        if self.protocol == PROTOCOL_TCP:
-            packet.op = Packet.OP_BIND_TCP
-        elif self.protocol == PROTOCOL_UDP:
-            packet.op = Packet.OP_BIND_UDP
-
-        # print('SEND')
-        # print(packet)
-
-        self.sock.sendall(packet.toBytes())
-        print('[Client] Local Port %s forward to %s' % (str(self.localaddr), str((server_addr, remoteport))))
-
-    def stop(self):
-        self.shouldStop = True
-
-    def run(self):
+    def send(self, conn : socket):
+        packet = self._buildPacket()
+        packet = Packet.MAGIC_NUM + pack('!I', len(packet)) + packet
         try:
-            self.__run()
-        finally:
-            for s in self.socks:
-                s.close()
+            conn.sendall(packet)
+        except Exception as ex:
+            raise SocketError(conn, ex)
+
+    def _buildPacket(self) -> bytes:
+        if DEBUG_MODE:
+            print('Send [op=%d, host=%s, port=%d, data_len=%d]' % (self.op,self.host,self.port,len(self.data)))
+        bhost = self.host.encode('utf-8')
+        return pack('!BHH', self.op, self.port, len(bhost)) + bhost + self.data
+
+    def _resolvePacket(self, data: bytes):
+        self.op, self.port, host_len = unpack('!BHH', data[:5])
+        self.host = data[5 : 5 + host_len].decode('utf-8')
+        self.data = data[5 + host_len :]
+        if DEBUG_MODE:
+            print('Recv [op=%d, host=%s, port=%d, data_len=%d]' % (self.op,self.host,self.port,len(self.data)))
+
+TCP_RECV_BUFF = 8192
+UDP_RECV_BUFF = 65507
+UDP_IDLE_TIMEOUT = 120
+HEARTBEAT_TIME = 30
+SHOW_ERR_LOG = False
+DEBUG_MODE = False
+
+class AbstractTunnel(Thread):
+    def __init__(self, conn : socket, server_side : bool = False):
+        super().__init__(target=self.__run)
+        self.__server_side = server_side
+        self.__socket = conn
+        self.__sockets = [conn]
+        self.__should_stop = False
+        self.__timeout = 1
+
+        self.__switchTree = {}
+        self.__switchTree[Packet.OP_SOCKET_CLOSED] = self.__onSocketClosed
+        self.__switchTree[Packet.OP_BIND_TCP] = self._onBindTcp
+        self.__switchTree[Packet.OP_BIND_UDP] = self._onBindUdp
+        self.__switchTree[Packet.OP_USER_CONN] = self._onUserConnect
+        self.__switchTree[Packet.OP_USER_MSG] = self._onUserMsg
+        self.__switchTree[Packet.OP_USER_DISCONN] = self._onUserDisconnect
+        self.__switchTree[Packet.OP_ERROR] = self._onErrorMsg
+        self.__switchTree[Packet.OP_PING] = self._onPing
+        self.__switchTree[Packet.OP_PONG] = self._onPong
+
+# Private =====================================================================
 
     def __run(self):
-        import select
-        import time
+        try:
+            self._onStart()
+        except Exception as ex:
+            self._err(self.__socket, ex)
+            self.__should_stop = True
 
-        virtual_clients = {}
-        udp_lastaccess = {}
+        if self.__server_side:
+            self.__serverRun()
+        else:
+            self.__clientRun()
 
-        def getRemoteAddr(conn : socket.socket) -> tuple:
-            for i in virtual_clients:
-                if conn is virtual_clients[i]:
-                    strs = i.split(':')
-                    return (strs[0], int(strs[1]))
-            return None
-        
-        lastaccess = time.time()
-        while not getattr(self.sock, '_closed') and not self.shouldStop:
-            readable, writable, exceptional = select.select(self.socks, [], self.socks, BLOCK_TIMEOUT)
-            if not readable and not exceptional and time.time() - lastaccess > PINGPONG_TIME:
-                packet = Packet()
-                packet.op = Packet.OP_PING
-                self.sock.sendall(packet.toBytes())
-                lastaccess = time.time()
-
-            sock : socket.socket
-            for sock in readable:
-                if sock is self.sock:
-                    packet = recvPacket(sock)
-                    # print('RECV')
-                    # print(packet)
-                    if not packet:
-                        print('[Client] Lost server connection')
-                        sock.close()
-                        break
-                    
-                    key = '%s:%d' % (packet.client_ip, packet.client_port)
-                    if packet.op == Packet.OP_CLIENT_CONN:
-                        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        try:
-                            client.connect(self.localaddr)
-                        except:
-                            packet.op = Packet.OP_CLIENT_DISCONN
-                            self.sock.sendall(packet.toBytes())
-                            continue
-                        self.socks.append(client)
-                        print('[Client] New TCP Connection %s as %s' % (str(client.getsockname()), key))
-                        virtual_clients[key] = client
-                    elif packet.op == Packet.OP_CLIENT_SEND:
-                        if self.protocol == PROTOCOL_TCP:
-                            if not key in virtual_clients:
-                                client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                                try:
-                                    client.connect(self.localaddr)
-                                except:
-                                    packet.op = Packet.OP_CLIENT_DISCONN
-                                    packet.data = b''
-                                    self.sock.sendall(packet.toBytes())
-                                    continue
-                                self.socks.append(client)
-                                print('[Client] New TCP Connection %s as %s' % (str(client.getsockname()), key))
-                                virtual_clients[key] = client
-
-                            client = virtual_clients[key]
-                            client.sendall(packet.data)
-                        else:
-                            first = False
-                            if not key in virtual_clients:
-                                first = True
-                                client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                                self.socks.append(client)
-                                virtual_clients[key] = client
-                            
-
-                            client = virtual_clients[key]
-                            udp_lastaccess[key] = time.time()
-                            client.sendto(packet.data, self.localaddr)
-                            if first:
-                                print('[Client] New UDP Connection %s as %s' % (str(client.getsockname()), key))
-                    elif packet.op == Packet.OP_CLIENT_DISCONN:
-                        if key in virtual_clients:
-                            client = virtual_clients[key]
-                            print('[Client] TCP Connection %s as %s Disconnected By Remote' % (str(client.getsockname()), key))
-                            client.close()
-                            self.socks.remove(client)
-                            del virtual_clients[key]
-                    elif packet.op == Packet.OP_PONG:
-                        # print('PONG')
-                        pass
-                    else:
-                        raise Exception('Packet Error')
-
-                else:
-                    packet = Packet()
-                    packet.client_ip, packet.client_port = getRemoteAddr(sock)
-                    key = '%s:%d' % (packet.client_ip, packet.client_port)
-                    if self.protocol == PROTOCOL_TCP:
-                        try:
-                            data = sock.recv(TCP_DATA_SIZE)
-                        except:
-                            if not sock in exceptional:
-                                exceptional.append(sock)
-                            continue
-                        if data:
-                            packet.op = Packet.OP_CLIENT_SEND
-                            packet.data = data
-                        else:
-                            packet.op = Packet.OP_CLIENT_DISCONN
-                            self.socks.remove(sock)
-                            print('[Client] TCP Connection %s as %s Disconnected By Local' % (str(sock.getsockname()), key))
-                            del virtual_clients[key]
-                            sock.close()
-                    else:
-                        udp_lastaccess[key] = time.time()
-                        data, addr = sock.recvfrom(UDP_DATA_SIZE)
-                        packet.op = Packet.OP_CLIENT_SEND
-                        packet.data = data
-                    
-                    # print('SEND')
-                    # print(packet)
-
-                    self.sock.sendall(packet.toBytes())
-                    lastaccess = time.time()
-            
-            for sock in exceptional:
-                print('Exception on: %s' % str(sock))
-                if sock is not self.sock:
-                    packet = Packet()
-                    packet.client_ip, packet.client_port = getRemoteAddr(sock)
-                    key = '%s:%d' % (packet.client_ip, packet.client_port)
-                    packet.op = Packet.OP_CLIENT_DISCONN
-                    del virtual_clients[key]
-                    print('[Client] TCP Connection %s as %s Disconnected By Error' % (str(sock.getsockname()), key))
-
-                    # print('SEND')
-                    # print(packet)
-
-                    self.sock.sendall(packet.toBytes())
-                    lastaccess = time.time()
-                else:
-                    print('[Client] Lost server connection')
-                self.socks.remove(sock)
-                sock.close()
-
-            if self.protocol == PROTOCOL_UDP:
-                c = []
-                t = time.time()
-                for s in self.socks:
-                    if s is not self.sock:
-                        cip, cport = getRemoteAddr(s)
-                        key = '%s:%d' % (cip, cport)
-                        if t - udp_lastaccess[key] > UDP_TIMEOUT:
-                            c.append(s)
-                for s in c:
-                    self.socks.remove(s)
-                    cip, cport = getRemoteAddr(s)
-                    key = '%s:%d' % (cip, cport)
-                    del virtual_clients[key]
-                    del udp_lastaccess[key]
-                    print('[Client] UDP Socket %s as %s Timeout, Closed' % (str(s.getsockname()), key))
-                    s.close()
-            
-        for s in self.socks:
+        try:
+            self._onStop()
+        except Exception as ex:
+            self._err(self.__socket, ex)
+        for s in self.__sockets:
             s.close()
+
+    def __serverRun(self):
+        while not self.__should_stop:
+            readable, _, closeable = select(self.__sockets, [], self.__sockets, self.__timeout)
+            if not readable and not closeable:
+                try:
+                    self._onIdle()
+                except Exception as ex:
+                    self._err(self.__socket, ex)
+                    self.__should_stop = True
+            for s in readable:
+                try:
+                    if s is self.__socket:
+                        conn, _ = s.accept()
+                        self._addSocket(conn)
+                    else:
+                        packet = Packet(s)
+                        self.__switchTree[packet.op](s, packet)
+                except SocketError as ex:
+                    self._err(ex.conn, ex.ex)
+                    if ex.conn not in closeable:
+                        closeable.append(s)
+                except Exception as ex:
+                    self._err(s, ex)
+                    if s not in closeable:
+                        closeable.append(s)
+            for s in closeable:
+                self.__onSocketClosed(s)
+
+    def __clientRun(self):
+        while not self.__should_stop:
+            readable, _, closeable = select(self.__sockets, [], self.__sockets, self.__timeout)
+            if not readable and not closeable:
+                try:
+                    self._onIdle()
+                except Exception as ex:
+                    self._err(self.__socket, ex)
+                    self.__should_stop = True
+            for s in readable:
+                try:
+                    if s is self.__socket:
+                        packet = Packet(s)
+                        self.__switchTree[packet.op](s, packet)
+                    else:
+                        self._onUnknownReadable(s)
+                except SocketError as ex:
+                    self._err(ex.conn, ex.ex)
+                    if ex.conn in self.__sockets and ex.conn not in closeable:
+                        closeable.append(ex.conn)
+                except Exception as ex:
+                    self._err(s, ex)
+                    if s not in closeable:
+                        closeable.append(s)
+            for s in closeable:
+                self.__onSocketClosed(s)
+
+    def __onSocketClosed(self, conn : socket, packet : Packet = None):
+        if conn is self.__socket:
+            self.__should_stop = True
+        else:
+            if not self.__server_side:
+                try:
+                    self._onUnknownError(conn)
+                except:
+                    pass
+            self._removeSocket(conn)
+            conn.close()
+
+# Private =====================================================================
+
+# Protected ===================================================================
+
+    def _err(self, conn, ex):
+        if SHOW_ERR_LOG:
+            print('# ==================================')
+            print('Thread: %s' % self.getName())
+            print(conn)
+            if DEBUG_MODE:
+                import traceback
+                traceback.print_exc()
+            else:
+                print('[%s] %s' % (ex.__class__.__name__, ex))
+            print('# ==================================')
+
+        receiver = None
+        if self.__server_side:
+            if conn is not self.__socket:
+                receiver = conn
+        elif conn is self.__socket:
+            receiver = self.__socket
+        if receiver:
+            try:
+                packet = Packet()
+                packet.op = Packet.OP_ERROR
+                packet.data = ('[%s] %s' % (ex.__class__.__name__, ex)).encode('utf-8')
+                packet.send(receiver)
+            except:
+                pass
+
+    def _addSocket(self, conn : socket):
+        if conn not in self.__sockets:
+            self.__sockets.append(conn)
+
+    def _removeSocket(self, conn : socket):
+        if conn in self.__sockets:
+            self.__sockets.remove(conn)
+
+# Protected ===================================================================
+
+# Public ======================================================================
+
+    def stop(self):
+        self.__should_stop = True
+    
+    def setTimeout(self, timeout : int):
+        self.__timeout = timeout
+
+# Public ======================================================================
+
+# Abstract ====================================================================
+
+    def _onStart(self):
+        pass
+
+    def _onStop(self):
+        pass
+
+    def _onIdle(self):
+        pass
+
+    def _onBindTcp(self, conn : socket, packet : Packet):
+        raise NotImplementedError('Do not support this operate: %d' % packet.op)
+
+    def _onBindUdp(self, conn : socket, packet : Packet):
+        raise NotImplementedError('Do not support this operate: %d' % packet.op)
+
+    def _onUserConnect(self, conn : socket, packet : Packet):
+        raise NotImplementedError('Do not support this operate: %d' % packet.op)
+
+    def _onUserMsg(self, conn : socket, packet : Packet):
+        raise NotImplementedError('Do not support this operate: %d' % packet.op)
+
+    def _onUserDisconnect(self, conn : socket, packet : Packet):
+        raise NotImplementedError('Do not support this operate: %d' % packet.op)
+
+    def _onErrorMsg(self, conn : socket, packet : Packet):
+        raise NotImplementedError('Do not support this operate: %d' % packet.op)
+
+    def _onPing(self, conn : socket, packet : Packet):
+        raise NotImplementedError('Do not support this operate: %d' % packet.op)
+
+    def _onPong(self, conn : socket, packet : Packet):
+        raise NotImplementedError('Do not support this operate: %d' % packet.op)
+
+    def _onUnknownReadable(self, conn : socket):
+        raise NotImplementedError
+
+    def _onUnknownError(self, conn : socket):
+        raise NotImplementedError
+
+# Abstract ====================================================================
+
+# Server ======================================================================
+
+class TCPVirtualServer(AbstractTunnel):
+    def __init__(self, conn : socket, port : int):
+        super().__init__(conn)
+        self.setName('Virtual Server TCP:%s' % port)
+        self.__source = conn
+        self.__target = socket(AF_INET, SOCK_STREAM)
+        self.__target.bind(('0.0.0.0', port))
+        self.__clients = {}
+
+    def _onStart(self):
+        self.__target.listen()
+        self._addSocket(self.__target)
+        print('[Server] Client %s bind to port TCP:%d' % (self.__source.getpeername(), self.__target.getsockname()[1]))
+
+    def _onStop(self):
+        print('[Server] Port TCP:%d closed.' % self.__target.getsockname()[1])
+
+    def _onUserMsg(self, conn : socket, packet : Packet):
+        key = str((packet.host, packet.port))
+        if key in self.__clients:
+            target = self.__clients[key]
+            try:
+                target.sendall(packet.data)
+            except Exception as ex:
+                raise SocketError(target, ex)
+        else:
+            packet.op = Packet.OP_USER_DISCONN
+            packet.data = b''
+            packet.send(conn)
+
+    def _onUserDisconnect(self, conn : socket, packet : Packet):
+        key = str((packet.host, packet.port))
+        if key in self.__clients:
+            target = self.__clients[key]
+            self._removeSocket(target)
+            del self.__clients[key]
+            target.close()
+        elif DEBUG_MODE:
+            print('Unknown connection %s' % key)
+
+    def _onErrorMsg(self, conn : socket, packet : Packet):
+        pass
+
+    def _onPing(self, conn : socket, packet : Packet):
+        packet = Packet()
+        packet.op = Packet.OP_PONG
+        packet.send(conn)
+
+    def _onUnknownReadable(self, conn : socket):
+        if conn is self.__target:
+            try:
+                nconn, addr = conn.accept()
+                self.__clients[str(addr)] = nconn
+                self._addSocket(nconn)
+            except Exception as ex:
+                self._err(conn, ex)
+                return
+            packet = Packet()
+            packet.op = Packet.OP_USER_CONN
+            packet.host, packet.port = addr
+            packet.send(self.__source)
+        else:
+            data = conn.recv(TCP_RECV_BUFF)
+            packet = Packet()
+            packet.host, packet.port = conn.getpeername()
+            if data:
+                packet.op = Packet.OP_USER_MSG
+                packet.data = data
+            else:
+                packet.op = Packet.OP_USER_DISCONN
+                del self.__clients[str(conn.getpeername())]
+                self._removeSocket(conn)
+            packet.send(self.__source)
+
+    def _onUnknownError(self, conn : socket):
+        packet = Packet()
+        packet.op = Packet.OP_USER_DISCONN
+        packet.host, packet.port = conn.getpeername()
+        packet.send(self.__source)
+
+class UDPVirtualServer(AbstractTunnel):
+    def __init__(self, conn : socket, port : int):
+        super().__init__(conn)
+        self.setName('Virtual Server UDP:%s' % port)
+        self.__source = conn
+        self.__port = port
+        self.__target = socket(AF_INET, SOCK_DGRAM)
+        self.__target.bind(('0.0.0.0', port))
+
+    def _onStart(self):
+        self._addSocket(self.__target)
+        print('[Server] Client %s bind to port UDP:%d' % (self.__source.getpeername(), self.__target.getsockname()[1]))
+
+    def _onStop(self):
+        print('[Server] Port UDP:%d closed.' % self.__target.getsockname()[1])
+
+    def _onUserMsg(self, conn : socket, packet : Packet):
+        addr = (packet.host, packet.port)
+        self.__target.sendto(packet.data, addr)
+
+    def _onErrorMsg(self, conn : socket, packet : Packet):
+        pass
+
+    def _onPing(self, conn : socket, packet : Packet):
+        packet = Packet()
+        packet.op = Packet.OP_PONG
+        packet.send(conn)
+
+    def _onUnknownReadable(self, conn : socket):
+        data, addr = conn.recvfrom(UDP_RECV_BUFF)
+        packet = Packet()
+        packet.op = Packet.OP_USER_MSG
+        packet.host, packet.port = addr
+        packet.data = data
+        packet.send(self.__source)
+
+    def _onUnknownError(self, conn : socket):
+        pass
+
+class NATTunnelServer(AbstractTunnel):
+    def __init__(self, port : int = 12345, cert_file : str = None, key_file : str = None):
+        self.__vslist = {}
+        self.__server = socket(AF_INET, SOCK_STREAM)
+        self.__server.bind(('0.0.0.0', port))
+        if cert_file:
+            self.__server = wrap_socket(self.__server, keyfile = key_file, certfile = cert_file, server_side = True, ssl_version=PROTOCOL_TLSv1_2)
+        super().__init__(self.__server, True)
+        self.setName('NAT Tunnel Server')
+
+    def _onStart(self):
+        self.__server.listen()
+        print('NAT Tunnel Server Started. Port: %s' % self.__server.getsockname()[1])
+
+    def _onStop(self):
+        print('NAT Tunnel Server Closing...')
+        for port in self.__vslist:
+            if self.__vslist[port].isAlive():
+                self.__vslist[port].stop()
+
+    def __createVirtualServer(self, conn, port, clazz):
+        if port in self.__vslist and self.__vslist[port].isAlive():
+            raise RuntimeError('Port %d already in use.' % port)
+        vs = clazz(conn, port)
+        vs.start()
+        self._removeSocket(conn)
+        self.__vslist[port] = vs
+
+    def _onBindTcp(self, conn : socket, packet : Packet):
+        self.__createVirtualServer(conn, packet.port, TCPVirtualServer)
+    
+    def _onBindUdp(self, conn : socket, packet : Packet):
+        self.__createVirtualServer(conn, packet.port, UDPVirtualServer)
+
+# Server ======================================================================
+
+# Client ======================================================================
+
+class NATTunnelTCPClient(AbstractTunnel):
+    def __init__(self, server_addr : str, local_addr : tuple, remote_port : int, server_port : int = 12345):
+        self.__local_addr = local_addr
+        remote = socket(AF_INET, SOCK_STREAM)
+        remote.connect((server_addr, server_port))
+        try:
+            remote = wrap_socket(remote, ssl_version=PROTOCOL_TLSv1_2)
+        except:
+            remote = socket(AF_INET, SOCK_STREAM)
+            remote.connect((server_addr, server_port))
+        self.__remote = remote
+        super().__init__(remote)
+        self.__local_addr = local_addr
+        self.__remote_port = remote_port
+        self.__clients = {}
+        self.__lastaccess = None
+        self.setName('NAT Tunnel Client TCP:%s' % remote_port)
+
+    def _onStart(self):
+        packet = Packet()
+        packet.op = Packet.OP_BIND_TCP
+        packet.port = self.__remote_port
+        packet.send(self.__remote)
+        self.__lastaccess = time()
+        print('NAT Tunnel Client Forward TCP:%s:%d to TCP:%s:%d' % (self.__local_addr[0], self.__local_addr[1], self.__remote.getpeername()[0], self.__remote_port))
+
+    def _onStop(self):
+        print('NAT Tunnel Client TCP:%d Stopped' % self.__remote_port)
+
+    def _onIdle(self):
+        if time() - self.__lastaccess > HEARTBEAT_TIME:
+            packet = Packet()
+            packet.op = Packet.OP_PING
+            packet.send(self.__remote)
+            self.__lastaccess = time()
+
+    def _onUserConnect(self, conn : socket, packet : Packet):
+        self.__lastaccess = time()
+
+        key = (packet.host, packet.port)
+        client = socket(AF_INET, SOCK_STREAM)
+        self._addSocket(client)
+        self.__clients[str(key)] = client
+        try:
+            client.connect(self.__local_addr)
+        except Exception as ex:
+            self._err(client, ex)
+            raise SocketError(client, ex)
+        print('[Client] New TCP Connection %s as %s' % (client.getsockname(), key))
+
+    def _onUserMsg(self, conn : socket, packet : Packet):
+        self.__lastaccess = time()
+
+        key = str((packet.host, packet.port))
+        if key in self.__clients:
+            client = self.__clients[key]
+            try:
+                client.sendall(packet.data)
+            except Exception as ex:
+                self._err(client, ex)
+                raise SocketError(client, ex)
+        else:
+            packet.op = Packet.OP_USER_DISCONN
+            packet.data = b''
+            packet.send(conn)
+
+    def _onUserDisconnect(self, conn : socket, packet : Packet):
+        self.__lastaccess = time()
+
+        key = str((packet.host, packet.port))
+        if key in self.__clients:
+            client = self.__clients[key]
+            print('[Client] TCP Connection %s as %s disconnected by remote.' % (client.getsockname(), key))
+            client.close()
+            del self.__clients[key]
+            self._removeSocket(client)
+        elif DEBUG_MODE:
+            print('Unknown connection %s' % key)
+
+    def _onErrorMsg(self, conn : socket, packet : Packet):
+        print('[Error] %s' % packet.data.decode('utf-8'))
+
+    def _onPong(self, conn : socket, packet : Packet):
+        pass
+
+    def _onUnknownReadable(self, conn : socket):
+        packet = Packet()
+        key = None
+        for k in self.__clients:
+            if conn is self.__clients[k]:
+                key = k
+                break
+        if key:
+            packet.host, packet.port = eval(key)
+        else:
+            raise Exception('Cannot find target client.')
+        data = conn.recv(TCP_RECV_BUFF)
+        if data:
+            packet.op = Packet.OP_USER_MSG
+            packet.data = data
+        else:
+            packet.op = Packet.OP_USER_DISCONN
+            print('[Client] TCP Connection %s as %s disconnected by local.' % (conn.getsockname(), key))
+            self._removeSocket(conn)
+            del self.__clients[key]
+            conn.close()
+        packet.send(self.__remote)
+        self.__lastaccess = time()
+
+    def _onUnknownError(self, conn : socket):
+        key = None
+        for k in self.__clients:
+            if conn is self.__clients[k]:
+                key = k
+                break
+        if key:
+            packet = Packet()
+            packet.op = Packet.OP_USER_DISCONN
+            packet.host, packet.port = eval(key)
+            packet.send(self.__remote)
+            self.__lastaccess = time()
+            del self.__clients[key]
+            print('[Client] TCP Connection %s as %s disconnected by local.' % (conn.getsockname(), key))
+
+class NATTunnelUDPClient(AbstractTunnel):
+    def __init__(self, server_addr : str, local_addr : tuple, remote_port : int, server_port : int = 12345):
+        self.__local_addr = local_addr
+        remote = socket(AF_INET, SOCK_STREAM)
+        remote.connect((server_addr, server_port))
+        try:
+            remote = wrap_socket(remote, ssl_version=PROTOCOL_TLSv1_2)
+        except:
+            remote = socket(AF_INET, SOCK_STREAM)
+            remote.connect((server_addr, server_port))
+        self.__remote = remote
+        super().__init__(remote)
+        self.__local_addr = local_addr
+        self.__remote_port = remote_port
+        self.__clients = {}
+        self.__lastaccess = {}
+        self.setName('NAT Tunnel Client UDP:%s' % remote_port)
+
+    def _onStart(self):
+        packet = Packet()
+        packet.op = Packet.OP_BIND_UDP
+        packet.port = self.__remote_port
+        packet.send(self.__remote)
+        self.__lastaccess['remote'] = time()
+        print('NAT Tunnel Client Forward UDP:%s:%d to UDP:%s:%d' % (self.__local_addr[0], self.__local_addr[1], self.__remote.getpeername()[0], self.__remote_port))
+
+    def _onStop(self):
+        print('NAT Tunnel Client UDP:%d Stopped' % self.__remote_port)
+
+    def _onIdle(self):
+        delk = []
+        for k in self.__clients:
+            l = self.__lastaccess[k]
+            if time() - l > UDP_IDLE_TIMEOUT:
+                delk.append(k)
+        for k in delk:
+            print('[Client] UDP Connection %s as %s idle timeout expired.' % (self.__clients[k].getsockname(), k))
+            self._removeSocket(self.__clients[k])
+            self.__clients[k].close()
+            del self.__clients[k]
+            
+        if time() - self.__lastaccess['remote'] > HEARTBEAT_TIME:
+            packet = Packet()
+            packet.op = Packet.OP_PING
+            packet.send(self.__remote)
+            self.__lastaccess['remote'] = time()
+
+    def _onUserMsg(self, conn : socket, packet : Packet):
+        self.__lastaccess['remote'] = time()
+        key = str((packet.host, packet.port))
+        first = False
+        if key not in self.__clients:
+            self.__clients[key] = socket(AF_INET, SOCK_DGRAM)
+            self._addSocket(self.__clients[key])
+            self.__lastaccess[key] = time()
+            first = True
+        client = self.__clients[key]
+        client.sendto(packet.data, self.__local_addr)
+        if first:
+            print('[Client] New UDP Connection %s as %s' % (client.getsockname(), key))
+
+    def _onErrorMsg(self, conn : socket, packet : Packet):
+        print('[Error] %s' % packet.data.decode('utf-8'))
+
+    def _onPong(self, conn : socket, packet : Packet):
+        pass
+
+    def _onUnknownReadable(self, conn : socket):
+        data, _ = conn.recvfrom(UDP_RECV_BUFF)
+        packet = Packet()
+        packet.op = Packet.OP_USER_MSG
+        key = None
+        for k in self.__clients:
+            if conn is self.__clients[k]:
+                key = k
+                break
+        if key:
+            self.__lastaccess[key] = time()
+            packet.host, packet.port = eval(key)
+            packet.data = data
+            packet.send(self.__remote)
+            self.__lastaccess['remote'] = time()
+        else:
+            raise Exception('Cannot find target client.')
+
+    def _onUnknownError(self, conn : socket):
+        pass
+
+# Client ======================================================================
+
+# Commandline =================================================================
+
+if __name__ == "__main__":
+    def main():
+        from sys import argv
+
+        THREADS = []
+
+        def threadsAlive():
+            alive = False
+            for t in THREADS:
+                alive = alive or t.isAlive()
+            return alive
+
+        def usage():
+            print('Usage:')
+            print(' NAT Tunnel Server')
+            print('  nattunnel server [{--port|-p}=PORT] [{--cert_file|-cf}=CERT_FILE_PATH]')
+            print('                   [{--key_file|-kf}=KEY_FILE_PATH]')
+            print('  Example:')
+            print('   nattunnel server')
+            print('   nattunnel server --port=2377')
+            print('   nattunnel server --port=1324 --cert_file=server.pem')
+            print('   nattunnel server -p=2323 -cf=server.crt -kf=ca.key')
+            print()
+            print(' NAT Tunnel Client')
+            print('  nattunnel client {--server|-s}=SERVER_ADDR[:SERVER_PORT]')
+            print('                   {--conf|-c}={TCP|UDP}:LOCAL_ADDR:LOCAR_PORT:REMOTE_PORT')
+            print('                   [{--conf|-c}=CONF2 [{--conf|-c}=CONF3 [...]]]')
+            print('  Example:')
+            print('   nattunnel client --server=example.com --conf=tcp:localhost:10343:25565')
+            print('   nattunnel client --s=example.com:4579 -c:localhost:443:443 -c=udp:1.1.1.1:53:53')
+
+        def client(server : tuple, conf : list):
+            cl = []
+            for c in conf:
+                strs = c.lower().split(':')
+                if len(strs) != 4 or strs[0] != 'tcp' and strs[0] != 'udp' or not strs[2].isnumeric() or not strs[3].isnumeric():
+                    raise Exception('Wrong Conf %s' % c)
+                cl.append([strs[0], strs[1], int(strs[2]), int(strs[3])])
+            try:
+                for c in cl:
+                    client = None
+                    if c[0] == 'tcp':
+                        client = NATTunnelTCPClient(server[0], (c[1], c[2]), c[3], server[1])
+                    else:
+                        client = NATTunnelUDPClient(server[0], (c[1], c[2]), c[3], server[1])
+                    THREADS.append(client)
+                    client.start()
+            except Exception as ex:
+                print(ex)
+
+        def server(port : int, cert_file : str, key_file : str):
+            try:
+                server = NATTunnelServer(port, cert_file, key_file)
+                THREADS.append(server)
+                server.start()
+            except Exception as ex:
+                print(ex)
+
+        class ArgDict:
+            def __init__(self, args, allow):
+                self.__d = {}
+                self.__allow = allow
+                for arg in args:
+                    strs = arg.split('=')
+                    if len(strs) != 2:
+                        continue
+                    a = self.__getAllow(strs[0])
+                    if a:
+                        if a[0] not in self.__d:
+                            self.__d[a[0]] = []
+                        self.__d[a[0]].append(strs[1])
+
+            def __getAllow(self, key):
+                a = None
+                for i in self.__allow:
+                    if key in i:
+                        a = i
+                        break
+                return a
+
+            def __getitem__(self, index):
+                if index not in self.__d:
+                    return []
+                else:   
+                    return self.__d[index]
+
+        args = argv[1:]
+        if args:
+            if args[0] == 'client':
+                argd = ArgDict(args[1:], [['--server', '-s'], ['--conf', '-c']])
+                if argd['--server'] and argd['--conf']:
+                    addr = argd['--server'][0]
+                    port = 12345
+                    if ':' in addr:
+                        try:
+                            addr, port = addr.split(':')
+                            port = int(port)
+                        except:
+                            print('Server Argument Error.')
+                            usage()
+                    try:
+                        client((addr, port), argd['--conf'])
+                    except Exception as ex:
+                        print(ex)
+                        usage()
+                else:
+                    usage()
+            elif args[0] == 'server':
+                argd = ArgDict(args[1:], [['--port', '-p'], ['--cert_file', '-cf'], ['--key_file', '-kf']])
+                port = 12345
+                cert_file = None
+                key_file = None
+                try:
+                    if argd['--port']:
+                        port = int(argd['--port'][0])
+                except:
+                    print('Port Argument Error.')
+                    usage()
+                if argd['--cert_file']:
+                    cert_file = argd['--cert_file'][0]
+                if argd['--key_file']:
+                    key_file = argd['--key_file'][0]
+                server(port, cert_file, key_file)
+            else:
+                usage()
+        else:
+            usage()
+    
+        try:
+            while threadsAlive():
+                sleep(1)
+        except:
+            for t in THREADS:
+                t.stop()
+    main()
