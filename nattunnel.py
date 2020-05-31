@@ -120,10 +120,18 @@ class AbstractTunnel(Thread):
             self._err(self.__socket, ex)
             self.__should_stop = True
 
-        if self.__server_side:
-            self.__serverRun()
-        else:
-            self.__clientRun()
+        while not self.__should_stop:
+            readable, _, closeable = select(self.__sockets, [], self.__sockets, self.__timeout)
+            if not readable and not closeable:
+                try:
+                    self._onIdle()
+                except Exception as ex:
+                    self._err(self.__socket, ex)
+                    self.__should_stop = True
+            if self.__server_side:
+                self.__serverRun(readable, closeable)
+            else:
+                self.__clientRun(readable, closeable)
 
         try:
             self._onStop()
@@ -132,23 +140,19 @@ class AbstractTunnel(Thread):
         for s in self.__sockets:
             s.close()
 
-    def __serverRun(self):
-        while not self.__should_stop:
-            readable, _, closeable = select(self.__sockets, [], self.__sockets, self.__timeout)
-            if not readable and not closeable:
+    def __serverRun(self, readable, closeable):
+        for s in readable:
+            if s is self.__socket:
                 try:
-                    self._onIdle()
+                    conn, _ = s.accept()
                 except Exception as ex:
-                    self._err(self.__socket, ex)
-                    self.__should_stop = True
-            for s in readable:
+                    self._err(s, ex)
+                    continue
+                self._addSocket(conn)
+            else:
                 try:
-                    if s is self.__socket:
-                        conn, _ = s.accept()
-                        self._addSocket(conn)
-                    else:
-                        packet = Packet(s)
-                        self.__switchTree[packet.op](s, packet)
+                    packet = Packet(s)
+                    self.__switchTree[packet.op](s, packet)
                 except SocketError as ex:
                     self._err(ex.conn, ex.ex)
                     if ex.conn not in closeable:
@@ -157,35 +161,27 @@ class AbstractTunnel(Thread):
                     self._err(s, ex)
                     if s not in closeable:
                         closeable.append(s)
-            for s in closeable:
-                self.__onSocketClosed(s)
+        for s in closeable:
+            self.__onSocketClosed(s)
 
-    def __clientRun(self):
-        while not self.__should_stop:
-            readable, _, closeable = select(self.__sockets, [], self.__sockets, self.__timeout)
-            if not readable and not closeable:
-                try:
-                    self._onIdle()
-                except Exception as ex:
-                    self._err(self.__socket, ex)
-                    self.__should_stop = True
-            for s in readable:
-                try:
-                    if s is self.__socket:
-                        packet = Packet(s)
-                        self.__switchTree[packet.op](s, packet)
-                    else:
-                        self._onUnknownReadable(s)
-                except SocketError as ex:
-                    self._err(ex.conn, ex.ex)
-                    if ex.conn in self.__sockets and ex.conn not in closeable:
-                        closeable.append(ex.conn)
-                except Exception as ex:
-                    self._err(s, ex)
-                    if s not in closeable:
-                        closeable.append(s)
-            for s in closeable:
-                self.__onSocketClosed(s)
+    def __clientRun(self, readable, closeable):
+        for s in readable:
+            try:
+                if s is self.__socket:
+                    packet = Packet(s)
+                    self.__switchTree[packet.op](s, packet)
+                else:
+                    self._onUnknownReadable(s)
+            except SocketError as ex:
+                self._err(ex.conn, ex.ex)
+                if ex.conn in self.__sockets and ex.conn not in closeable:
+                    closeable.append(ex.conn)
+            except Exception as ex:
+                self._err(s, ex)
+                if s not in closeable:
+                    closeable.append(s)
+        for s in closeable:
+            self.__onSocketClosed(s)
 
     def __onSocketClosed(self, conn : socket, packet : Packet = None):
         if conn is self.__socket:
