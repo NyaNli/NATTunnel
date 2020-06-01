@@ -1,5 +1,5 @@
 from threading import Thread
-from socket import socket, AF_INET, SOCK_STREAM, SOCK_DGRAM
+from socket import socket, AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR
 from ssl import wrap_socket, PROTOCOL_TLSv1_2
 from struct import pack, unpack
 from select import select
@@ -414,6 +414,7 @@ class NATTunnelServer(AbstractTunnel):
     def __init__(self, port : int = 12345, cert_file : str = None, key_file : str = None):
         self.__vslist = {}
         self.__server = socket(AF_INET, SOCK_STREAM)
+        self.__server.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
         self.__server.bind(('0.0.0.0', port))
         if cert_file:
             self.__server = wrap_socket(self.__server, keyfile = key_file, certfile = cert_file, server_side = True, ssl_version=PROTOCOL_TLSv1_2)
