@@ -694,7 +694,7 @@ if __name__ == "__main__":
             print('                   [{--conf|-c}=CONF2 [{--conf|-c}=CONF3 [...]]]')
             print('  Example:')
             print('   nattunnel client --server=example.com --conf=tcp:localhost:10343:25565')
-            print('   nattunnel client --s=example.com:4579 -c:localhost:443:443 -c=udp:1.1.1.1:53:53')
+            print('   nattunnel client --s=example.com:4579 -c=tcp:localhost:443:443 -c=udp:1.1.1.1:53:53')
 
         def client(server : tuple, conf : list):
             cl = []
